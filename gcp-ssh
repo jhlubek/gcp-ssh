@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Verify dependencies
+for dep in gcloud fzf column; do
+  if ! command -v "$dep" &>/dev/null; then
+    echo "error: '$dep' is required but not found in PATH" >&2
+    exit 1
+  fi
+done
+
+# Collect any --project=... or --project ... args passed before -- so we can
+# forward them to instances list as well.  Everything after -- is passed
+# straight to gcloud compute ssh.
+list_args=()
+ssh_args=()
+explicit_project=""
+use_iap=true
+passthrough=false
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --)
+      passthrough=true
+      ssh_args+=("$1")
+      shift
+      ;;
+    --no-iap)
+      use_iap=false
+      shift
+      ;;
+    --project=*)
+      explicit_project="${1#--project=}"
+      list_args+=("$1")
+      shift
+      ;;
+    --project)
+      shift
+      explicit_project="$1"
+      list_args+=(--project "$1")
+      shift
+      ;;
+    *)
+      if $passthrough; then
+        ssh_args+=("$1")
+      else
+        ssh_args+=("$1")
+      fi
+      shift
+      ;;
+  esac
+done
+
+# When no explicit project is given, prompt the user to pick one.
+if [[ -z "$explicit_project" ]]; then
+  projects=$(
+    gcloud projects list \
+      --format="table[no-heading](projectId,name,lifecycleState)" \
+      2>/dev/null | column -t
+  )
+  if [[ -z "$projects" ]]; then
+    echo "No projects found." >&2
+    exit 1
+  fi
+  selected_project=$(
+    echo "$projects" \
+      | fzf \
+          --header="PROJECT_ID  NAME  STATE" \
+          --reverse \
+          --prompt="project> " \
+          --no-sort
+  ) || { echo "Cancelled." >&2; exit 0; }
+  read -r explicit_project _ <<<"$selected_project"
+  list_args+=(--project "$explicit_project")
+fi
+
+# Fetch instance list.
+# The project column may be empty when listing within a single project,
+# so we append it as a separate awk column below.
+instances=$(
+  gcloud compute instances list \
+    "${list_args[@]+"${list_args[@]}"}" \
+    --format="table[no-heading](name,zone.basename(),networkInterfaces[0].networkIP,status,project)" \
+  2>/dev/null | column -t
+)
+
+if [[ -z "$instances" ]]; then
+  echo "No instances found." >&2
+  exit 1
+fi
+
+header="NAME  ZONE  IP  STATUS  PROJECT"
+
+selected=$(
+  echo "$instances" \
+    | fzf \
+        --header="$header" \
+        --header-lines=0 \
+        --reverse \
+        --prompt="instance> " \
+        --no-sort
+) || { echo "Cancelled." >&2; exit 0; }
+
+# Parse the selected line (whitespace-delimited columns).
+# project may be empty when gcloud omits it for single-project listings.
+read -r name zone _ip _status project <<<"$selected"
+
+# Fall back to the explicit or active project if not in the output.
+if [[ -z "$project" ]]; then
+  project="$explicit_project"
+fi
+
+if [[ -z "$name" || -z "$zone" || -z "$project" ]]; then
+  echo "error: could not parse selection - name='$name' zone='$zone' project='$project'" >&2
+  exit 1
+fi
+
+iap_flag=""
+$use_iap && iap_flag="--tunnel-through-iap"
+
+cmd="gcloud compute ssh $name --zone=$zone --project=$project${iap_flag:+ $iap_flag}"
+if [[ ${#ssh_args[@]} -gt 0 ]]; then
+  cmd="$cmd ${ssh_args[*]}"
+fi
+
+echo "=> $cmd"
+
+exec gcloud compute ssh "$name" \
+  --zone="$zone" \
+  --project="$project" \
+  ${iap_flag:+"$iap_flag"} \
+  "${ssh_args[@]+"${ssh_args[@]}"}"
